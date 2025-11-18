@@ -2,4 +2,4 @@
 
 #include "graph.cuh"
 
-int *dijkstras(graph_t *g, int src);
+int *bmssp(graph_t *g, int *srcs);

@@ -33,7 +33,7 @@ int main(int argc, char **argv)
     print_graph(&g);
 
     // Run Dijkstra's
-    int *dist_dijk = dijkstras(&g, num_nodes, src);
+    int *dist_dijk = dijkstras(&g, src);
 
     // Print
     printf("\n");

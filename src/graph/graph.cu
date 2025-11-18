@@ -3,32 +3,17 @@
 #include <stdlib.h>
 #include <time.h>
 
-void init_adj_list(adj_list_t *a, int max_adj)
-{    
-    // Allocate members
-    a->adj_nodes   = (int *)malloc(max_adj * sizeof(int));
-    a->adj_weights = (int *)malloc(max_adj * sizeof(int));
-
-    // Set members
-    a->num_adj = 0;
-}
-
-void deinit_adj_list(adj_list_t *a)
-{
-    // Free members
-    free(a->adj_nodes);
-    free(a->adj_weights);
-}
-
 void init_graph(graph_t *g, int num_nodes, int max_adj)
 {
     // Allocate members
-    g->adj_lists = (adj_list_t *)malloc(num_nodes * sizeof(adj_list_t));
+    g->adj_nodes   = (int *)malloc(num_nodes * max_adj * sizeof(int));
+    g->adj_weights = (int *)malloc(num_nodes * max_adj * sizeof(int));
 
     // Set members
-    for (int i = 0; i < num_nodes; i++)
+    for (int i = 0; i < num_nodes * max_adj; i++)
     {
-        init_adj_list(&g->adj_lists[i], max_adj);
+        g->adj_weights[i] = -1;
+        g->adj_nodes[i] = -1;
     }
     g->num_nodes = num_nodes;
     g->max_adj = max_adj;
@@ -37,52 +22,28 @@ void init_graph(graph_t *g, int num_nodes, int max_adj)
 void deinit_graph(graph_t *g)
 {
     // Free members
-    for (int i = 0; i < g->num_nodes; i++)
-    {
-        deinit_adj_list(&g->adj_lists[i]);
-    }
-    free(g->adj_lists);
+    free(g->adj_nodes);
+    free(g->adj_weights);
 }
 
 void print_graph(graph_t *g)
 {
     for (int i = 0; i < g->num_nodes; i++)
     {
-        adj_list_t a = g->adj_lists[i];
-
         printf("Node %d:\n", i);
-        for (int j = 0; j < a.num_adj; j++)
+        for (int j = 0; j < g->max_adj; j++)
         {
+            int adj_node = g->adj_nodes[g->max_adj * i + j];
+            int adj_weight = g->adj_weights[g->max_adj * i + j];
+
+            // End of list early?
+            if (adj_node == -1) { break; }
+
             printf("  --> %d | w = %d\n",
-                   a.adj_nodes[j],
-                   a.adj_weights[j]);
+                   adj_node,
+                   adj_weight);
         }
     }
-}
-
-bool is_edge_adj_list(adj_list_t *a, int dest)
-{
-    for (int i = 0; i < a->num_adj; i++)
-    {
-        if (a->adj_nodes[i] == dest) { return true; }
-    }
-
-    return false;
-}
-
-// Warning: Does not test for overflow
-// Return: -1 on error, else 0
-int add_edge_adj_list(adj_list_t *a, int dest, int weight)
-{
-    // Edge already exists?
-    if (is_edge_adj_list(a, dest)) { return -1; }
-
-    // Add the edge
-    a->adj_nodes[a->num_adj] = dest;
-    a->adj_weights[a->num_adj] = weight;
-    a->num_adj++;
-
-    return 0;
 }
 
 // Return: -1 on error, else 0
@@ -92,14 +53,30 @@ int add_edge_graph(graph_t *g, int src, int dest, int weight)
     if (src  >= g->num_nodes ||
         dest >= g->num_nodes) { return -1; }
     
-    // Get list
-    adj_list_t *a = &g->adj_lists[src];
+    for (int j = 0; j < g->max_adj; j++)
+    {
+        int *adj_node = &g->adj_nodes[g->max_adj * src + j];
+        int *adj_weight = &g->adj_weights[g->max_adj * src + j];
 
-    // Full?
-    if (a->num_adj >= g->max_adj) { return -1; }
+        // Empty space?
+        if (*adj_node == -1)
+        {
+            // Add the edge
+            *adj_node = dest;
+            *adj_weight = weight;
 
-    // Add the edge
-    return add_edge_adj_list(a, dest, weight);
+            return 0;
+        }
+
+        // Already present?
+        if (*adj_node == dest)
+        {
+            return -1;
+        }
+    }
+
+    // Full!
+    return -1;
 }
 
 graph_t generate_graph(int num_nodes, int num_adj, int max_weight)
@@ -107,7 +84,7 @@ graph_t generate_graph(int num_nodes, int num_adj, int max_weight)
     // Initialize
     graph_t g;
     init_graph(&g, num_nodes, num_adj);
-    
+
     // No edges?
     if (num_adj <= 0) { return g; }
 

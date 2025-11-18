@@ -1,19 +1,10 @@
-#ifndef GRAPH_CUH
-#define GRAPH_CUH
-
-// Adjacency list
-typedef struct
-{
-    int *adj_nodes;
-    int *adj_weights;
-    int num_adj;
-}
-adj_list_t;
+#pragma once
 
 // Graph (weighted, directed)
 typedef struct
 {
-    adj_list_t *adj_lists;
+    int *adj_nodes;   // num_nodes rows, max_adj columns. -1 = padding.
+    int *adj_weights; // num_nodes rows, max_adj columns. -1 = padding.
     int num_nodes;
     int max_adj;
 }
@@ -27,5 +18,3 @@ void print_graph(graph_t *g);
 int add_edge_graph(graph_t *g, int src, int dest, int weight);
 
 graph_t generate_graph(int num_nodes, int num_adj, int max_weight=20);
-
-#endif
