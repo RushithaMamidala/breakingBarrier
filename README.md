@@ -2,7 +2,7 @@
 
 ## Build Instructions
 
-From the main directory, run:
+From this directory, run:
 
 `make`
 
