@@ -1,5 +1,4 @@
-#ifndef MIN_HEAP_CUH
-#define MIN_HEAP_CUH
+#pragma once
 
 typedef struct
 {
@@ -23,5 +22,3 @@ int push_min_heap(min_heap_t *h, int node, int dist);
 node_data_t pop_min_heap(min_heap_t *h);
 
 bool is_empty_heap(min_heap_t *h);
-
-#endif
