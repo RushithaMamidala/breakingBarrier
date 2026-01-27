@@ -416,7 +416,7 @@ static void ds_split_block(pivot_ds *ds, block *b) {
     double old_upper = b->upper;
 
     /* Sort items by value (n ≤ M+something, very small) */
-    qsort(b->items, n, sizeof(data_pair), compare_dpair_val);
+    qsort(b->items, n, sizeof(data_pair), compare_dpair_val);    
 
     int n1 = n / 2;
     int n2 = n - n1;

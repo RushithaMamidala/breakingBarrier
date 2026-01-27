@@ -60,170 +60,135 @@ __device__ inline double atomicMinDouble(double* addr, double val) {
 }
 
 __global__ void relax_frontier_nodes(
-    int* g_indices,
-    int* g_adj_nodes,
-    double* g_weights,
+    const int* __restrict__ g_indices,
+    const int* __restrict__ g_adj_nodes,
+    const double* __restrict__ g_weights,
     const int* __restrict__ frontier_nodes,
     int frontier_count,
     double* __restrict__ distances,
     double bound,
-    int* nodes_to_add
+    int* __restrict__ nodes_to_add,
+    int* __restrict__ add_count
 ) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= frontier_count) return;
-    extern __shared__ int smem[];
-    int* next_count = &smem[0];
-    if (threadIdx.x == 0) *next_count = -1;
-    __syncthreads();
-    int u = frontier_nodes[j];
-    if (u < 0 ) return;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= frontier_count) return;
 
+    // Anchor at unique frontier node
+    int u = frontier_nodes[i];
+    if (u < 0) return;
+
+    // Fetch node data
     double du = distances[u];
-
     int start = g_indices[u];
     int end   = g_indices[u + 1];
 
-    for (int a = start; a < end; a++) {
+    // Loop over all adjacent nodes
+    for (int a = start; a < end; a++)
+    {
+        // Compute candidate for new distance
         int v = g_adj_nodes[a];
         if (v < 0) continue;
-
         double cand = du + g_weights[a];
 
-        // Relax dist[v] atomically
+        // Atomic relaxation
         double old = atomicMinDouble(&distances[v], cand);
 
-        // If we actually improved (or tied) AND under bound, push v to next set
-        if (cand <= old && cand < bound) {
-            // dedupe (optional but usually helpful)
-            int pos = atomicAdd(next_count, 1);
-            nodes_to_add[pos] = v;  // may overflow if next_nodes is too small
+        // Only enqueue if actually improved and under bound
+        if (cand < old && cand < bound)
+        {
+            atomicAdd(add_count, 1);
+            nodes_to_add[*add_count] = v;
         }
-    }
-    if (threadIdx.x == 0) {
-        int pos = *next_count;
-        nodes_to_add[pos+1] = -1;
     }
 }
 
 void find_pivots(graph* g, double bound, int k, node_set* source_set, double* distances, pivot_returns* piv_ret){
     if (verbose) printf("Find pivots called\n");
 
-    // working_set = W, w_cur = current frontier, w_next = next frontier
+    // working_set = W
     node_set* working_set = (node_set*)malloc(sizeof(node_set));
-    node_set* w_cur = (node_set*)malloc(sizeof(node_set));
+    int *frontier = working_set->nodes;
+    int frontier_size = working_set->count;
     init_node_set(working_set, g->num_nodes);
-    init_node_set(w_cur, g->num_nodes);
 
     // Initialize W and W0 to S
     copy_node_set(source_set, working_set);
-    copy_node_set(source_set, w_cur);
-
-    node_set* w_next = (node_set*)malloc(sizeof(node_set));
-    init_node_set(w_next, g->num_nodes); 
 
     // k relaxation rounds (bounded by "cand < bound" for adding into W sets)
-    for( int i=1;i<=k;i++){
-        
+    for(int i=1;i<=k;i++)
+    {    
         // CPU relaxation from current frontier w_cur into w_next
-        w_next->count = 0;
-        // int threads = 8;
-        // int blocks = (w_cur->count + threads - 1) / threads;
-        // cudaError_t cuda_ret;
+        int threads = 8;
+        int blocks = (frontier_size+ threads - 1) / threads;
+        cudaError_t cuda_ret;
 
-        // int* g_indices;
-        // int* g_adj_nodes;
-        // double* g_weights;
-        // int* nodes_d;
-        // int* count_d;
-        // double* distances_d;
-        // double* bound_d;
+        int* g_indices;
+        int* g_adj_nodes;
+        double* g_weights;
+        int* frontier_d;
+        double* distances_d;
+        int* nodes_to_add_d;
+        int* add_count_d;
 
-        // cuda_ret = cudaMalloc((void**) &g_adj_nodes, g->indices[g->num_nodes]*sizeof(int));
-        // if(cuda_ret != cudaSuccess) printf("cudaMalloc(nodes_d, %zu) failed: %s\n", (size_t)w_cur->count * sizeof(int), cudaGetErrorString(cuda_ret));
-        // cuda_ret = cudaMalloc((void**) &g_indices, (g->num_nodes+1)*sizeof(int));
-        // if(cuda_ret != cudaSuccess) printf("cudaMalloc(nodes_d, %zu) failed: %s\n", (size_t)w_cur->count * sizeof(int), cudaGetErrorString(cuda_ret));
-        // cuda_ret = cudaMalloc((void**) &g_weights, g->indices[g->num_nodes] * sizeof(double));
-        // if(cuda_ret != cudaSuccess) printf("Unable to allocate device memory4\n");
-        // cuda_ret = cudaMalloc((void**) &nodes_d, w_cur->count * sizeof(int));
-        // if(cuda_ret != cudaSuccess) printf("Unable to allocate device memory2\n");
-        // cuda_ret = cudaMalloc((void**) &count_d, sizeof(int));
-        // if(cuda_ret != cudaSuccess) printf("Unable to allocate device memory3\n");
-        // cuda_ret = cudaMalloc((void**) &distances_d, g->num_nodes * sizeof(double));
-        // if(cuda_ret != cudaSuccess) printf("Unable to allocate device memory4\n");
-        // cuda_ret = cudaMalloc((void**) &bound_d, sizeof(double));
-        // if(cuda_ret != cudaSuccess) printf("Unable to allocate device memory5\n");
+        cuda_ret = cudaMalloc((void**) &g_adj_nodes, g->indices[g->num_nodes]*sizeof(int));
+        if(cuda_ret != cudaSuccess) printf("cudaMalloc(frontier_d, %zu) failed: %s\n", (size_t)frontier_size * sizeof(int), cudaGetErrorString(cuda_ret));
+        cuda_ret = cudaMalloc((void**) &g_indices, (g->num_nodes+1)*sizeof(int));
+        if(cuda_ret != cudaSuccess) printf("cudaMalloc(frontier_d, %zu) failed: %s\n", (size_t)frontier_size * sizeof(int), cudaGetErrorString(cuda_ret));
+        cuda_ret = cudaMalloc((void**) &g_weights, g->indices[g->num_nodes] * sizeof(double));
+        if(cuda_ret != cudaSuccess) printf("Unable to allocate device memory\n");
+        cuda_ret = cudaMalloc((void**) &frontier_d, frontier_size * sizeof(int));
+        if(cuda_ret != cudaSuccess) printf("Unable to allocate device memory\n");
+        cuda_ret = cudaMalloc((void**) &distances_d, g->num_nodes * sizeof(double));
+        if(cuda_ret != cudaSuccess) printf("Unable to allocate device memory\n");
+        cuda_ret = cudaMalloc((void**) &nodes_to_add_d, g->indices[g->num_nodes] * sizeof(int));
+        if(cuda_ret != cudaSuccess) printf("Unable to allocate device memory\n");
+        cuda_ret = cudaMalloc((void**) &add_count_d, sizeof(int));
+        if(cuda_ret != cudaSuccess) printf("Unable to allocate device memory\n");
 
-        // int* nodes_to_add = NULL;
-        // cuda_ret = cudaMalloc((void**) &nodes_to_add, g->indices[g->num_nodes] * sizeof(int));
+        cudaDeviceSynchronize();
 
-        // cudaDeviceSynchronize();
+        cuda_ret = cudaMemcpy(g_adj_nodes, g->adj_nodes, g->indices[g->num_nodes]*sizeof(int), cudaMemcpyHostToDevice);
+        if(cuda_ret != cudaSuccess) printf("Unable to copy memory to device\n");
+        cuda_ret = cudaMemcpy(g_indices, g->indices, (g->num_nodes+1)*sizeof(int), cudaMemcpyHostToDevice);
+        if(cuda_ret != cudaSuccess) printf("Unable to copy memory to device\n");
+        cuda_ret = cudaMemcpy(g_weights, g->weights, g->indices[g->num_nodes]*sizeof(int), cudaMemcpyHostToDevice);
+        if(cuda_ret != cudaSuccess) printf("Unable to copy memory to device\n");
+        cuda_ret = cudaMemcpy(frontier_d, frontier, frontier_size * sizeof(int), cudaMemcpyHostToDevice);
+        if(cuda_ret != cudaSuccess) printf("Unable to copy memory to device\n");
+        cuda_ret = cudaMemcpy(distances_d, distances, g->num_nodes * sizeof(double), cudaMemcpyHostToDevice);
+        if(cuda_ret != cudaSuccess) printf("Unable to copy memory to device\n");
+        cudaMemset(add_count_d, 0, sizeof(int));
 
-        // cuda_ret = cudaMemcpy(g_adj_nodes, g->adj_nodes, g->indices[g->num_nodes]*sizeof(int), cudaMemcpyHostToDevice);
-        // if(cuda_ret != cudaSuccess) printf("Unable to copy memory to device1\n");
-        // cuda_ret = cudaMemcpy(g_indices, g->indices, (g->num_nodes+1)*sizeof(int), cudaMemcpyHostToDevice);
-        // if(cuda_ret != cudaSuccess) printf("Unable to copy memory to device1\n");
-        // cuda_ret = cudaMemcpy(g_weights, g->weights, g->indices[g->num_nodes]*sizeof(int), cudaMemcpyHostToDevice);
-        // if(cuda_ret != cudaSuccess) printf("Unable to copy memory to device1\n");
-        // cuda_ret = cudaMemcpy(nodes_d, w_cur->nodes, w_cur->count*sizeof(int), cudaMemcpyHostToDevice);
-        // if(cuda_ret != cudaSuccess) printf("Unable to copy memory to device2\n");
-        // cuda_ret = cudaMemcpy(count_d, &w_cur->count, sizeof(int), cudaMemcpyHostToDevice);
-        // if(cuda_ret != cudaSuccess) printf("Unable to copy memory to device3\n");
-        // cuda_ret = cudaMemcpy(distances_d, distances, g->num_nodes * sizeof(double), cudaMemcpyHostToDevice);
-        // if(cuda_ret != cudaSuccess) printf("Unable to copy memory to device4\n");
-        // cuda_ret = cudaMemcpy(bound_d, &bound, sizeof(double), cudaMemcpyHostToDevice);
-        // if(cuda_ret != cudaSuccess) printf("Unable to copy memory to device5\n");
+        // Kernel call
+        size_t shmem_bytes = sizeof(int);
+        relax_frontier_nodes<<<blocks, threads, shmem_bytes>>>(
+            g_indices,
+            g_adj_nodes,
+            g_weights,
+            frontier_d,
+            frontier_size,
+            distances_d,
+            bound,
+            nodes_to_add_d,
+            add_count_d
+        );
+        cuda_ret = cudaDeviceSynchronize();
 
-        // size_t shmem_bytes = sizeof(int);
-        // relax_frontier_nodes<<<blocks, threads, shmem_bytes>>>(
-        //     g_indices,
-        //     g_adj_nodes,
-        //     g_weights,
-        //     w_cur->nodes,
-        //     w_cur->count,
-        //     distances,
-        //     bound,
-        //     nodes_to_add
-        // );
-        // cuda_ret = cudaDeviceSynchronize();
-        // int* nodes_to_add_host = (int*)malloc(sizeof(int)*g->num_nodes);
-        // cuda_ret = cudaMemcpy(nodes_to_add_host, nodes_to_add, sizeof(int)*g->num_nodes, cudaMemcpyDeviceToHost);
-        // for(int idx = 0;;idx++){
-        //     if (nodes_to_add_host[idx]==-1) break;
-        //     node_set_add(w_next, nodes_to_add_host[idx]);
-        //     node_set_add(working_set, nodes_to_add_host[idx]);
-        // }
+        int* nodes_to_add_host = (int*)malloc(sizeof(int)*g->num_nodes);
+        cuda_ret = cudaMemcpy(nodes_to_add_host, nodes_to_add_d, sizeof(int)*g->num_nodes, cudaMemcpyDeviceToHost);
+        if(cuda_ret != cudaSuccess) printf("Unable to copy memory to host\n");
+        cuda_ret = cudaMemcpy(&frontier_size, add_count_d, sizeof(int), cudaMemcpyDeviceToHost);
+        if(cuda_ret != cudaSuccess) printf("Unable to copy memory to host\n");
 
-        for(int j=0; j<w_cur->count;j++){
-            int u = w_cur->nodes[j];
-            
-            double du = distances[u];
-            int start = g->indices[u];
-            int end = g->indices[u+1];
-            for(int a=start; a<end; a++){
-                int v = g->adj_nodes[a];
-                if (v < 0) continue;  // padding if any
-                double w_uv = g->weights[a];
-                double cand = du + w_uv;
-                // Relax and update distance if improved (or tied)
-                if (cand <= distances[v]) {
-                    // 8: db[v] ← db[u] + wuv
-                    distances[v] = cand;
-                    // Only expand into sets if cand is strictly under bound
-                    // 9: if distances[u] + wuv < B then 
-                    if (cand < bound) {
-                        // 10: Wi ← Wi ∪ {v}
-                        node_set_add(w_next, v);
-                        // 11: W ← W ∪ Wi   (we will add incrementally)
-                        node_set_add(working_set, v);
-                    }
-                }
-            }
+        // Update frontier
+        frontier += frontier_size;
+
+        // Append frontier to W
+        for(int idx = 0; idx < frontier_size; idx++)
+        {
+            node_set_add(working_set, nodes_to_add_host[idx]);
         }
-        // Prepare for next iteration: Wi becomes Wi-1
-        copy_node_set(w_next, w_cur);
     }
-    // w0 no longer needed
-    free_node_set(w_cur);
 
     node_set* pivots = (node_set*)malloc(sizeof(node_set));
     init_node_set(pivots, g->num_nodes);
