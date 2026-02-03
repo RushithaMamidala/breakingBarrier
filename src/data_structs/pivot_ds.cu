@@ -406,23 +406,92 @@ static void ds_remove_block(pivot_ds *ds, block *b) {
     block_free(b);
 }
 
+static inline void dpair_swap(data_pair *a, data_pair *b) {
+    data_pair t = *a; *a = *b; *b = t;
+}
+
+static void partition_by_val(data_pair *a, int lo, int hi, double pivot, int *out_lt, int *out_gt)
+{
+    int lt = lo, i = lo, gt = hi;
+    while (i <= gt) {
+        double v = a[i].val;
+        if (v < pivot) dpair_swap(&a[lt++], &a[i++]);
+        else if (v > pivot) dpair_swap(&a[i], &a[gt--]);
+        else i++;
+    }
+    *out_lt = lt;
+    *out_gt = gt;
+}
+
+static void insertion_sort_by_val(data_pair *a, int lo, int hi) {
+    for (int i = lo + 1; i <= hi; ++i) {
+        data_pair x = a[i];
+        int j = i - 1;
+        while (j >= lo && a[j].val > x.val) {
+            a[j + 1] = a[j];
+            --j;
+        }
+        a[j + 1] = x;
+    }
+}
+
+
+static double median_of_medians(data_pair *a, int lo, int hi) {
+    int n = hi - lo + 1;
+    if (n <= 5) {
+        insertion_sort_by_val(a, lo, hi);
+        return a[lo + n/2].val;
+    }
+
+    // move medians of groups of 5 into front
+    int m = 0;
+    for (int g = lo; g <= hi; g += 5) {
+        int g_hi = g + 4;
+        if (g_hi > hi) g_hi = hi;
+        insertion_sort_by_val(a, g, g_hi);
+        int med = g + (g_hi - g)/2;
+        dpair_swap(&a[lo + m], &a[med]);
+        m++;
+    }
+
+    int mom_idx = lo + m/2;
+    mom_select(a, lo, lo + m - 1, mom_idx);
+    return a[mom_idx].val;
+}
+
+static void mom_select(data_pair *a, int lo, int hi, int nth) {
+    while (lo < hi) {
+        double pivot = median_of_medians(a, lo, hi);
+        int lt, gt;
+        partition_by_val(a, lo, hi, pivot, &lt, &gt);
+
+        if (nth < lt) hi = lt - 1;
+        else if (nth > gt) lo = gt + 1;
+        else return; // nth in == pivot region
+    }
+}
+
+
 /* ---------- Split a D1 block when size > M ---------- */
 
-static void ds_split_block(pivot_ds *ds, block *b) {
-    if (!b || !b->in_D1) return;
-    if (b->size <= ds->M) return;
-
+static block* ds_split_block(pivot_ds *ds, block *b) {
+    if (!b || !b->in_D1) return NULL;
+    if (b->size < ds->M){
+        if (verb) printf("\n %d %d\n", b->size, ds->M);
+        return NULL;
+    }
+    if (verb) printf("\nSplitting block during insert\n");
     int n = b->size;
     double old_upper = b->upper;
 
-    /* Sort items by value (n ≤ M+something, very small) */
-    qsort(b->items, n, sizeof(data_pair), compare_dpair_val);    
-
     int n1 = n / 2;
     int n2 = n - n1;
-
+    
+    mom_select(b->items, 0, n - 1, n1);
+    
     block *b2 = block_create(ds->M, 1);
 
+    //safe gaurd
     if (b2->capacity < n2) {
         b2->capacity = n2;
         b2->items = (data_pair *)realloc(b2->items, sizeof(data_pair) * b2->capacity);
@@ -435,13 +504,13 @@ static void ds_split_block(pivot_ds *ds, block *b) {
     b->size = n1;
 
     /* Update per-key metadata */
-    for (int i = 0; i < n1; ++i) {
+    for (int i = 0; i < b->size; ++i) {
         int k = b->items[i].key;
         ds->key_block[k] = b;
         ds->key_index[k] = i;
         ds->key_dist[k]   = b->items[i].val;
     }
-    for (int i = 0; i < n2; ++i) {
+    for (int i = 0; i < b2->size; ++i) {
         int k = b2->items[i].key;
         ds->key_block[k] = b2;
         ds->key_index[k] = i;
@@ -449,13 +518,21 @@ static void ds_split_block(pivot_ds *ds, block *b) {
     }
 
     /* Recompute block stats */
-    b->min_val = b->items[0].val;
-    b->max_val = b->items[n1 - 1].val;
-    b->upper   = b->max_val;
+    double bmin = 100000000, bmax = __DBL_MIN__;
+    for (int i = 0; i < b->size; ++i) {
+        double v = b->items[i].val;
+        if (v < bmin) bmin = v;
+        if (v > bmax) bmax = v;
+    }
+    b->min_val = bmin; b->max_val = bmax; b->upper = bmax;
 
-    b2->min_val = b2->items[0].val;
-    b2->max_val = b2->items[n2 - 1].val;
-    b2->upper   = b2->max_val;
+    double b2min = 100000000, b2max = __DBL_MIN__;
+    for (int i = 0; i < b2->size; ++i) {
+        double v = b2->items[i].val;
+        if (v < b2min) b2min = v;
+        if (v > b2max) b2max = v;
+    }
+    b2->min_val = b2min; b2->max_val = b2max; b2->upper = b2max;
 
     /* Insert b2 after block in D1 list */
     b2->next = b->next;
@@ -467,6 +544,7 @@ static void ds_split_block(pivot_ds *ds, block *b) {
     ds->tree_root = avl_delete_block(ds->tree_root, old_upper, b);
     ds->tree_root = avl_insert_block(ds->tree_root, b->upper, b);
     ds->tree_root = avl_insert_block(ds->tree_root, b2->upper, b2);
+    return b2;
 }
 
 /* ---------- Insert(a, b) ---------- */
@@ -495,7 +573,7 @@ void pivotds_insert(pivot_ds *ds, int key, double val) {
     }
 
     /* Find appropriate D1 block via upper-bound tree */
-    block *target = NULL;
+    block *target;
     if (ds->tree_root) {
         avl_node *node = avl_lower_bound(ds->tree_root, val);
         if (!node) node = avl_max_node(ds->tree_root);
@@ -508,9 +586,36 @@ void pivotds_insert(pivot_ds *ds, int key, double val) {
     }
 
     /* Ensure capacity */
-    if (target->size >= target->capacity) {
-        target->capacity *= 2;
-        target->items = (data_pair *)realloc(target->items, sizeof(data_pair) * target->capacity);
+    if (ds->M == 1) {
+        block *nb = block_create(1, 1);
+        if (!nb) return;
+
+        nb->min_val = nb->max_val = nb->upper = val;
+
+        /* Insert nb BEFORE target to preserve upper-bound ordering */
+        nb->next = target;
+        nb->prev = target->prev;
+        if (target->prev) target->prev->next = nb;
+        else ds->D1_head = nb;
+        target->prev = nb;
+
+        ds->tree_root = avl_insert_block(ds->tree_root, nb->upper, nb);
+        target = nb;
+    }else{
+        if (target->size >= target->capacity) {
+            // split at median
+            if (verb) pivotds_print(ds,0);
+            block *b2 = ds_split_block(ds, target);
+            if (verb) pivotds_print(ds,0);
+            if (b2) {
+                // Decide which half should receive (key,val)
+                // After split: target is lower half, b2 is upper half.
+                if (val > target->upper){
+                    target = b2;
+                    if (verb) printf("target is block b2\n");
+                }
+            }
+        }
     }
 
     int idx = target->size;
@@ -536,11 +641,11 @@ void pivotds_insert(pivot_ds *ds, int key, double val) {
     ds->key_block[key] = target;
     ds->key_index[key] = idx;
     ds->key_dist[key]   = val;
-
+    
     /* Split if necessary */
-    if (target->size > ds->M) {
-        ds_split_block(ds, target);
-    }
+    // if (target->size > ds->M) {
+    //     ds_split_block(ds, target);
+    // }
 }
 
 /* ---------- BatchPrepend(L) ---------- */
@@ -839,11 +944,11 @@ bmssp_returns* pivotds_pull(pivot_ds *ds) {
         if (first_after_D0->min_val < x) x = first_after_D0->min_val;
     }
     while(first_after_D1){
-        if (verb) printf("|%.2f|", first_after_D1->min_val);
+        // if (verb) printf("|%.2f|", first_after_D1->min_val);
         if (first_after_D1 && first_after_D1->size > 0 && first_after_D1->min_val >= max_in_S) {
             // printf("%d|",first_after_D1->min_val);
             if (first_after_D1->min_val < x) x = first_after_D1->min_val;
-            if (verb) printf("x: %.2f", x);
+            // if (verb) printf("x: %.2f", x);
         }
         first_after_D1 = first_after_D1->next;
     }

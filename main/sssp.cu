@@ -56,7 +56,7 @@ int main(int argc, char **argv)
     printf("Source: %d\n\nDijkstras distances:\n", src);
     for(int i = 0; i < g->num_nodes; i++)
     {
-        if (dist_dijk[i] == __DBL_MAX__){
+        if (dist_dijk[i] == 100000000){
             printf("%d -> %d, %d\t", src, i, -1);
             continue;
         }

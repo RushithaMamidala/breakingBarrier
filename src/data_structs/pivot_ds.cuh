@@ -54,10 +54,10 @@ typedef struct pivot_ds{
 /* Public API */
 
 /* ---------- Core DS Helpers ---------- */
-
+static void mom_select(data_pair *a, int lo, int hi, int nth);
 static void ds_remove_block(pivot_ds *ds, block *block);   /* forward */
 static void ds_delete_key(pivot_ds *ds, int key);
-static void ds_split_block(pivot_ds *ds, block *block);
+static block* ds_split_block(pivot_ds *ds, block *block);
 
 pivot_ds *pivotds_create(int M, double bound, int max_key);
 void     pivotds_destroy(pivot_ds *ds);
