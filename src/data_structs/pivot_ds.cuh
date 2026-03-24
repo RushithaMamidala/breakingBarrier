@@ -7,29 +7,30 @@ typedef struct {
 } data_pair;
 
 typedef struct block{
-    struct block *next;
-    struct block *prev;
-    data_pair       *items;
-    int          size;
-    int          capacity;
+    int next, prev;
+    data_pair *items;
+    int size;
+    int capacity;
     double min_val;
     double max_val;
     double upper;      /* used as key in tree for D1 */
     int in_D1;      /* 1 if in D1, 0 if in D0 */
+    int alive;
 } block;
 
 /* AVL tree node to index D1 blocks by upper bound */
 typedef struct block_list_node{
-    block *block_node;
-    struct block_list_node *next;
+    int block_idx;
+    int next; 
+    int alive;
 } block_list_node;
 
 typedef struct avl_node{
-    double              key;     /* upper bound */
-    block_list_node      *blocks;  /* list of blocks with this upper */
-    struct avl_node     *left;
-    struct avl_node     *right;
-    int                 height;
+    double key;     /* upper bound */
+    int blocks_head;  /* list of blocks with this upper */
+    int left, right;
+    int height;
+    int alive;
 } avl_node;
 
 /* Main DS structure */
@@ -37,16 +38,30 @@ typedef struct pivot_ds{
     int      M;
     double   bound;
     int      max_key;
-    
-    block   *D1_head;  /* insert blocks */
 
-    /* Balanced tree over D1 block uppers */
-    avl_node *tree_root;
+    int   D1_head;  /* insert blocks */
 
-    /* Per-key metadata: ensures unique smallest pair per key */
-    block   **key_block;  /* key -> block pointer (or NULL) */
-    int     *key_index;   /* key -> index inside block->items */
-    double  *key_dist;     /* key -> value (for convenience) */
+    /* AVL index over D1 block uppers */
+    int tree_root;
+
+    /* Block arena */
+    block   *blocks;  /* block arena: blocks[idx] is a block */
+    int blocks_used, blocks_cap;
+    int free_block_head;
+
+    /* AVL node arena */
+    avl_node *avl_nodes;
+    int avl_used, avl_cap;
+    int free_avl_head;
+
+    /* Per-AVL-node list of blocks sharing same upper */
+    block_list_node *bl_nodes;
+    int bl_used, bl_cap;
+    int free_bl_head;
+
+    int *key_block;          /* key -> block index, -1 if absent */
+    int *key_index;       /* key -> slot inside block->items */
+    double *key_dist;     /* key -> current best distance */
 }pivot_ds;
 
 /* Public API */

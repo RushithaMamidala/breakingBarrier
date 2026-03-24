@@ -6,252 +6,374 @@
 #include <limits.h>
 
 bool verb = 0;
+#define NIL (-1)
+#define INF 1000000000.0
+#define DBL_MAX 100000000.0
+
 /* ---------- Utility ---------- */
 
 static int max_int(int a, int b) { return a > b ? a : b; }
 
-/* ---------- AVL tree helpers ---------- */
+/* ---------- Arena helpers ---------- */
 
-static int avl_height(avl_node *n) {
-    return n==NULL ? 0 : n->height;
+static void ensure_block_cap(pivot_ds *ds) {
+    if (ds->blocks_used < ds->blocks_cap) return;
+    int new_cap = ds->blocks_cap ? ds->blocks_cap * 2 : 16;
+    ds->blocks = (block *)realloc(ds->blocks, new_cap * sizeof(block));
+    ds->blocks_cap = new_cap;
 }
 
-static void avl_update_height(avl_node *n) {
-    if (n!=NULL) n->height = 1 + max_int(avl_height(n->left), avl_height(n->right));
+static void ensure_avl_cap(pivot_ds *ds) {
+    if (ds->avl_used < ds->avl_cap) return;
+    int new_cap = ds->avl_cap ? ds->avl_cap * 2 : 16;
+    ds->avl_nodes = (avl_node *)realloc(ds->avl_nodes, new_cap * sizeof(avl_node));
+    ds->avl_cap = new_cap;
 }
 
-static avl_node *avl_rotate_right(avl_node *y) {
-    avl_node *x = y->left;
-    avl_node *T2 = x->right;
-    x->right = y;
+static void ensure_bl_cap(pivot_ds *ds) {
+    if (ds->bl_used < ds->bl_cap) return;
+    int new_cap = ds->bl_cap ? ds->bl_cap * 2 : 32;
+    ds->bl_nodes = (block_list_node *)realloc(ds->bl_nodes, new_cap * sizeof(block_list_node));
+    ds->bl_cap = new_cap;
+}
+
+static int alloc_block_slot(pivot_ds *ds) {
+    if (ds->free_block_head != NIL) {
+        int idx = ds->free_block_head;
+        ds->free_block_head = ds->blocks[idx].next;
+        ds->blocks[idx].alive = 1;
+        ds->blocks[idx].next = ds->blocks[idx].prev = NIL;
+        ds->blocks[idx].size = 0;
+        return idx;
+    }
+    ensure_block_cap(ds);
+    int idx = ds->blocks_used++;
+    memset(&ds->blocks[idx], 0, sizeof(block));
+    ds->blocks[idx].next = ds->blocks[idx].prev = NIL;
+    ds->blocks[idx].alive = 1;
+    return idx;
+}
+
+static void free_block_slot(pivot_ds *ds, int idx) {
+    if (idx == NIL) return;
+    ds->blocks[idx].alive = 0;
+    free(ds->blocks[idx].items);
+    ds->blocks[idx].items = NULL;
+    ds->blocks[idx].next = ds->free_block_head;
+    ds->free_block_head = idx;
+}
+
+static int alloc_avl_slot(pivot_ds *ds) {
+    if (ds->free_avl_head != NIL) {
+        int idx = ds->free_avl_head;
+        ds->free_avl_head = ds->avl_nodes[idx].left; /* freelist link stored in left */
+        ds->avl_nodes[idx].alive = 1;
+        ds->avl_nodes[idx].left = ds->avl_nodes[idx].right = NIL;
+        ds->avl_nodes[idx].blocks_head = NIL;
+        ds->avl_nodes[idx].height = 1;
+        return idx;
+    }
+    ensure_avl_cap(ds);
+    int idx = ds->avl_used++;
+    memset(&ds->avl_nodes[idx], 0, sizeof(avl_node));
+    ds->avl_nodes[idx].left = ds->avl_nodes[idx].right = NIL;
+    ds->avl_nodes[idx].blocks_head = NIL;
+    ds->avl_nodes[idx].height = 1;
+    ds->avl_nodes[idx].alive = 1;
+    return idx;
+}
+
+static void free_avl_slot(pivot_ds *ds, int idx) {
+    if (idx == NIL) return;
+    ds->avl_nodes[idx].alive = 0;
+    ds->avl_nodes[idx].left = ds->free_avl_head; /* freelist link */
+    ds->free_avl_head = idx;
+}
+
+static int alloc_bl_slot(pivot_ds *ds) {
+    if (ds->free_bl_head != NIL) {
+        int idx = ds->free_bl_head;
+        ds->free_bl_head = ds->bl_nodes[idx].next;
+        ds->bl_nodes[idx].alive = 1;
+        ds->bl_nodes[idx].next = NIL;
+        return idx;
+    }
+    ensure_bl_cap(ds);
+    int idx = ds->bl_used++;
+    memset(&ds->bl_nodes[idx], 0, sizeof(block_list_node));
+    ds->bl_nodes[idx].next = NIL;
+    ds->bl_nodes[idx].alive = 1;
+    return idx;
+}
+
+static void free_bl_slot(pivot_ds *ds, int idx) {
+    if (idx == NIL) return;
+    ds->bl_nodes[idx].alive = 0;
+    ds->bl_nodes[idx].next = ds->free_bl_head;
+    ds->free_bl_head = idx;
+}
+
+/* ---------- AVL helpers ---------- */
+
+static int avl_height(pivot_ds *ds, int nidx) {
+    return (nidx == NIL) ? 0 : ds->avl_nodes[nidx].height;
+}
+
+static void avl_update_height(pivot_ds *ds, int nidx) {
+    if (nidx != NIL) {
+        avl_node *n = &ds->avl_nodes[nidx];
+        n->height = 1 + max_int(avl_height(ds, n->left), avl_height(ds, n->right));
+    }
+}
+
+static int avl_rotate_right(pivot_ds *ds, int yidx) {
+    avl_node *y = &ds->avl_nodes[yidx];
+    int xidx = y->left;
+    avl_node *x = &ds->avl_nodes[xidx];
+    int T2 = x->right;
+
+    x->right = yidx;
     y->left = T2;
-    avl_update_height(y);
-    avl_update_height(x);
-    return x;
+
+    avl_update_height(ds, yidx);
+    avl_update_height(ds, xidx);
+    return xidx;
 }
 
-static avl_node *avl_rotate_left(avl_node *x) {
-    avl_node *y = x->right;
-    avl_node *T2 = y->left;
-    y->left = x;
+static int avl_rotate_left(pivot_ds *ds, int xidx) {
+    avl_node *x = &ds->avl_nodes[xidx];
+    int yidx = x->right;
+    avl_node *y = &ds->avl_nodes[yidx];
+    int T2 = y->left;
+
+    y->left = xidx;
     x->right = T2;
-    avl_update_height(x);
-    avl_update_height(y);
-    return y;
+
+    avl_update_height(ds, xidx);
+    avl_update_height(ds, yidx);
+    return yidx;
 }
 
-static int avl_get_balance(avl_node *n) {
-    return n!=NULL ? avl_height(n->left) - avl_height(n->right) : 0;
+static int avl_get_balance(pivot_ds *ds, int nidx) {
+    return (nidx != NIL) ? avl_height(ds, ds->avl_nodes[nidx].left) - avl_height(ds, ds->avl_nodes[nidx].right) : 0;
 }
 
-/* Create a new AVL node with single block in its list */
-static avl_node *avl_new_node(double key, block *b) {
-    avl_node *node = (avl_node *)malloc(sizeof(avl_node));
+static int avl_new_node(pivot_ds *ds, double key, int block_idx) {
+    int nidx = alloc_avl_slot(ds);
+    avl_node *node = &ds->avl_nodes[nidx];
     node->key = key;
-    node->left = NULL;
-    node->right = NULL;
+    node->left = node->right = NIL;
     node->height = 1;
-    block_list_node *bl = (block_list_node *)malloc(sizeof(block_list_node));
-    bl->block_node = b;
-    bl->next = NULL;
-    node->blocks = bl;
-    return node;
+
+    int blidx = alloc_bl_slot(ds);
+    ds->bl_nodes[blidx].block_idx = block_idx;
+    ds->bl_nodes[blidx].next = NIL;
+    node->blocks_head = blidx;
+    return nidx;
 }
 
-/* Insert block into node's block list */
-static void avl_add_block_to_node(avl_node *node, block *b) {
-    block_list_node *bl = (block_list_node *)malloc(sizeof(block_list_node));
-    bl->block_node = b;
-    bl->next = node->blocks;
-    node->blocks = bl;
+static void avl_add_block_to_node(pivot_ds *ds, int nidx, int block_idx) {
+    int blidx = alloc_bl_slot(ds);
+    ds->bl_nodes[blidx].block_idx = block_idx;
+    ds->bl_nodes[blidx].next = ds->avl_nodes[nidx].blocks_head;
+    ds->avl_nodes[nidx].blocks_head = blidx;
 }
 
-/* Insert (key, block) into AVL */
-static avl_node *avl_insert_block(avl_node *root, double key, block *b) {
-    if (root==NULL) return avl_new_node(key, b);
+static int avl_insert_block(pivot_ds *ds, int root, double key, int block_idx) {
+    if (root == NIL) return avl_new_node(ds, key, block_idx);
 
-    if (key < root->key) {
-        root->left = avl_insert_block(root->left, key, b);
-    } else if (key > root->key) {
-        root->right = avl_insert_block(root->right, key, b);
+    avl_node *r = &ds->avl_nodes[root];
+
+    if (key < r->key) {
+        r->left = avl_insert_block(ds, r->left, key, block_idx);
+    } else if (key > r->key) {
+        r->right = avl_insert_block(ds, r->right, key, block_idx);
     } else {
-        /* Same key: attach block to list */
-        avl_add_block_to_node(root, b);
+        avl_add_block_to_node(ds, root, block_idx);
         return root;
     }
 
-    avl_update_height(root);
-    int balance = avl_get_balance(root);
+    avl_update_height(ds, root);
+    int balance = avl_get_balance(ds, root);
 
-    /* Left Left */
-    if (balance > 1 && key < root->left->key)
-        return avl_rotate_right(root);
+    if (balance > 1 && key < ds->avl_nodes[r->left].key)
+        return avl_rotate_right(ds, root);
 
-    /* Right Right */
-    if (balance < -1 && key > root->right->key)
-        return avl_rotate_left(root);
+    if (balance < -1 && key > ds->avl_nodes[r->right].key)
+        return avl_rotate_left(ds, root);
 
-    /* Left Right */
-    if (balance > 1 && key > root->left->key) {
-        root->left = avl_rotate_left(root->left);
-        return avl_rotate_right(root);
+    if (balance > 1 && key > ds->avl_nodes[r->left].key) {
+        r->left = avl_rotate_left(ds, r->left);
+        return avl_rotate_right(ds, root);
     }
 
-    /* Right Left */
-    if (balance < -1 && key < root->right->key) {
-        root->right = avl_rotate_right(root->right);
-        return avl_rotate_left(root);
+    if (balance < -1 && key < ds->avl_nodes[r->right].key) {
+        r->right = avl_rotate_right(ds, r->right);
+        return avl_rotate_left(ds, root);
     }
 
     return root;
 }
 
-/* Remove a specific block from node->blocks, return 1 if list emptied */
-static int avl_remove_block_from_list(avl_node *node, block *b) {
-    block_list_node *prev = NULL, *cur = node->blocks;
-    while (cur) {
-        if (cur->block_node == b) {
-            if (prev) prev->next = cur->next;
-            else node->blocks = cur->next;
-            free(cur);
+static int avl_remove_block_from_list(pivot_ds *ds, int nidx, int block_idx) {
+    int prev = NIL;
+    int cur = ds->avl_nodes[nidx].blocks_head;
+
+    while (cur != NIL) {
+        if (ds->bl_nodes[cur].block_idx == block_idx) {
+            if (prev != NIL) ds->bl_nodes[prev].next = ds->bl_nodes[cur].next;
+            else ds->avl_nodes[nidx].blocks_head = ds->bl_nodes[cur].next;
+            free_bl_slot(ds, cur);
             break;
         }
         prev = cur;
-        cur = cur->next;
+        cur = ds->bl_nodes[cur].next;
     }
-    return node->blocks == NULL;
+    return ds->avl_nodes[nidx].blocks_head == NIL;
 }
 
-/* Free a node (assuming its children were handled) */
-static void avl_free_node(avl_node *node) {
-    block_list_node *bl = node->blocks;
-    while (bl) {
-        block_list_node *next = bl->next;
-        free(bl);
-        bl = next;
+static void avl_free_block_list(pivot_ds *ds, int head) {
+    int cur = head;
+    while (cur != NIL) {
+        int next = ds->bl_nodes[cur].next;
+        free_bl_slot(ds, cur);
+        cur = next;
     }
-    free(node);
 }
 
-/* Find minimum node in a subtree */
-static avl_node *avl_min_node(avl_node *node) {
-    avl_node *cur = node;
-    while (cur!=NULL && cur->left!=NULL) cur = cur->left;
+static void avl_free_node(pivot_ds *ds, int nidx) {
+    if (nidx == NIL) return;
+    avl_free_block_list(ds, ds->avl_nodes[nidx].blocks_head);
+    free_avl_slot(ds, nidx);
+}
+
+static int avl_min_node(pivot_ds *ds, int nidx) {
+    int cur = nidx;
+    while (cur != NIL && ds->avl_nodes[cur].left != NIL) cur = ds->avl_nodes[cur].left;
     return cur;
 }
 
-/* Delete (key, block) from AVL */
-static avl_node *avl_delete_block(avl_node *root, double key, block *b) {
-    if (!root) return NULL;
+static int avl_delete_node_entire(pivot_ds *ds, int root) {
+    if (root == NIL) return NIL;
 
-    if (key < root->key) {
-        root->left = avl_delete_block(root->left, key, b);
-    } else if (key > root->key) {
-        root->right = avl_delete_block(root->right, key, b);
-    } else {
-        /* key == root->key; remove block from list */
-        int list_empty = avl_remove_block_from_list(root, b);
-        if (!list_empty) {
-            /* Node stays; just updated list */
-            return root;
-        }
+    avl_node *r = &ds->avl_nodes[root];
 
-        /* No blocks left, delete this node */
-        if (!root->left || !root->right) {
-            avl_node *temp = root->left ? root->left : root->right;
-            if (!temp) {
-                /* No child */
-                avl_free_node(root);
-                return NULL;
-            } else {
-                /* One child */
-                *root = *temp;   /* Copy child into root */
-                free(temp);
-                /* Free the blocks list that was in old root (already freed above) */
-            }
-        } else {
-            /* Two children: get inorder successor */
-            avl_node *temp = avl_min_node(root->right);
-            /* Move successor's data into root */
-            block_list_node *old_blocks = root->blocks;
-            root->key = temp->key;
-            root->blocks = temp->blocks;
-            temp->blocks = old_blocks; /* so they will be freed when temp is deleted */
-            /* Delete successor node (which now has old_blocks) */
-            root->right = avl_delete_block(root->right, temp->key, NULL);
-            /* NOTE: in this path, block is already removed from list above */
-        }
+    if (r->left == NIL || r->right == NIL) {
+        int child = (r->left != NIL) ? r->left : r->right;
+        avl_free_node(ds, root);
+        return child;
     }
 
-    if (!root) return NULL;
+    int succ = avl_min_node(ds, r->right);
+    avl_node *s = &ds->avl_nodes[succ];
 
-    avl_update_height(root);
-    int balance = avl_get_balance(root);
+    avl_free_block_list(ds, r->blocks_head);
+    r->key = s->key;
+    r->blocks_head = s->blocks_head;
+    s->blocks_head = NIL;
 
-    if (balance > 1 && avl_get_balance(root->left) >= 0)
-        return avl_rotate_right(root);
+    r->right = avl_delete_node_entire(ds, r->right);
 
-    if (balance > 1 && avl_get_balance(root->left) < 0) {
-        root->left = avl_rotate_left(root->left);
-        return avl_rotate_right(root);
+    avl_update_height(ds, root);
+    int balance = avl_get_balance(ds, root);
+
+    if (balance > 1 && avl_get_balance(ds, r->left) >= 0)
+        return avl_rotate_right(ds, root);
+    if (balance > 1 && avl_get_balance(ds, r->left) < 0) {
+        r->left = avl_rotate_left(ds, r->left);
+        return avl_rotate_right(ds, root);
     }
-
-    if (balance < -1 && avl_get_balance(root->right) <= 0)
-        return avl_rotate_left(root);
-
-    if (balance < -1 && avl_get_balance(root->right) > 0) {
-        root->right = avl_rotate_right(root->right);
-        return avl_rotate_left(root);
+    if (balance < -1 && avl_get_balance(ds, r->right) <= 0)
+        return avl_rotate_left(ds, root);
+    if (balance < -1 && avl_get_balance(ds, r->right) > 0) {
+        r->right = avl_rotate_right(ds, r->right);
+        return avl_rotate_left(ds, root);
     }
 
     return root;
 }
 
-/* Lower bound search: smallest key >= x */
-static avl_node *avl_lower_bound(avl_node *root, double x) {
-    avl_node *res = NULL;
-    while (root) {
-        if (root->key >= x) {
+static int avl_delete_block(pivot_ds *ds, int root, double key, int block_idx) {
+    if (root == NIL) return NIL;
+
+    avl_node *r = &ds->avl_nodes[root];
+
+    if (key < r->key) {
+        r->left = avl_delete_block(ds, r->left, key, block_idx);
+    } else if (key > r->key) {
+        r->right = avl_delete_block(ds, r->right, key, block_idx);
+    } else {
+        int list_empty = avl_remove_block_from_list(ds, root, block_idx);
+        if (!list_empty) return root;
+        return avl_delete_node_entire(ds, root);
+    }
+
+    if (root == NIL) return NIL;
+
+    avl_update_height(ds, root);
+    int balance = avl_get_balance(ds, root);
+
+    if (balance > 1 && avl_get_balance(ds, ds->avl_nodes[root].left) >= 0)
+        return avl_rotate_right(ds, root);
+
+    if (balance > 1 && avl_get_balance(ds, ds->avl_nodes[root].left) < 0) {
+        ds->avl_nodes[root].left = avl_rotate_left(ds, ds->avl_nodes[root].left);
+        return avl_rotate_right(ds, root);
+    }
+
+    if (balance < -1 && avl_get_balance(ds, ds->avl_nodes[root].right) <= 0)
+        return avl_rotate_left(ds, root);
+
+    if (balance < -1 && avl_get_balance(ds, ds->avl_nodes[root].right) > 0) {
+        ds->avl_nodes[root].right = avl_rotate_right(ds, ds->avl_nodes[root].right);
+        return avl_rotate_left(ds, root);
+    }
+
+    return root;
+}
+
+static int avl_lower_bound(pivot_ds *ds, int root, double x) {
+    int res = NIL;
+    while (root != NIL) {
+        if (ds->avl_nodes[root].key >= x) {
             res = root;
-            root = root->left;
+            root = ds->avl_nodes[root].left;
         } else {
-            root = root->right;
-            
+            root = ds->avl_nodes[root].right;
         }
     }
     return res;
 }
 
-/* Free entire AVL tree (without freeing blocks) */
-static void avl_free_tree(avl_node *root) {
-    if (!root) return;
-    avl_free_tree(root->left);
-    avl_free_tree(root->right);
-    avl_free_node(root);
+static int avl_max_node(pivot_ds *ds, int root) {
+    if (root == NIL) return NIL;
+    while (ds->avl_nodes[root].right != NIL) root = ds->avl_nodes[root].right;
+    return root;
+}
+
+static void avl_free_tree(pivot_ds *ds, int root) {
+    if (root == NIL) return;
+    avl_free_tree(ds, ds->avl_nodes[root].left);
+    avl_free_tree(ds, ds->avl_nodes[root].right);
+    avl_free_node(ds, root);
 }
 
 /* ---------- block helpers ---------- */
 
-static block *block_create(int M, int in_D1) {
-    block *b = (block *)malloc(sizeof(block));
-    b->next = b->prev = NULL;
+static int block_create(pivot_ds *ds, int M, int in_D1) {
+    int idx = alloc_block_slot(ds);
+    block *b = &ds->blocks[idx];
+    b->next = b->prev = NIL;
     b->size = 0;
-    b->capacity = M;   /* initial capacity; can grow if needed */
+    b->capacity = M;
     b->items = (data_pair *)malloc(sizeof(data_pair) * b->capacity);
-    b->min_val = __DBL_MIN__;
-    b->max_val = 100000000;
-    b->upper  = 100000000;
-    b->in_D1  = in_D1;
-    return b;
+    b->min_val = DBL_MAX;
+    b->max_val = -DBL_MAX;
+    b->upper = INF;
+    b->in_D1 = in_D1;
+    return idx;
 }
 
-static void block_free(block *b) {
-    if (!b) return;
-    free(b->items);
-    free(b);
-}
-
-/* Comparator for sorting pairs by value */
 static int compare_dpair_val(const void *a, const void *b) {
     const data_pair *pa = (const data_pair *)a;
     const data_pair *pb = (const data_pair *)b;
@@ -263,146 +385,137 @@ static int compare_dpair_val(const void *a, const void *b) {
 /* ---------- DS Creation / Destruction ---------- */
 
 pivot_ds *pivotds_create(int M, double B, int max_key) {
-    if (verb) printf("Creating the special DS with M=%d\n",M);
     if (M <= 0 || max_key <= 0) return NULL;
-    pivot_ds *ds = (pivot_ds *)malloc(sizeof(pivot_ds));
+
+    pivot_ds *ds = (pivot_ds *)calloc(1, sizeof(pivot_ds));
     ds->M = M;
     ds->bound = B;
     ds->max_key = max_key;
 
-    ds->D1_head = NULL;
-    ds->tree_root = NULL;
+    ds->D1_head = NIL;
+    ds->tree_root = NIL;
 
-    ds->key_block = (block **)calloc(max_key, sizeof(block *));
+    ds->blocks = NULL; ds->blocks_used = ds->blocks_cap = 0; ds->free_block_head = NIL;
+    ds->avl_nodes = NULL; ds->avl_used = ds->avl_cap = 0; ds->free_avl_head = NIL;
+    ds->bl_nodes = NULL; ds->bl_used = ds->bl_cap = 0; ds->free_bl_head = NIL;
+
+    ds->key_block = (int *)malloc(sizeof(int) * max_key);
     ds->key_index = (int *)malloc(sizeof(int) * max_key);
-    ds->key_dist   = (double *)malloc(sizeof(double) * max_key);
-    // printf("Allocated\n");
+    ds->key_dist = (double *)malloc(sizeof(double) * max_key);
+
     for (int i = 0; i < max_key; ++i) {
-        ds->key_block[i] = NULL;
+        ds->key_block[i] = NIL;
         ds->key_index[i] = -1;
-        ds->key_dist[i]   = 100000000;
+        ds->key_dist[i] = INF;
     }
 
-    /* Initialize D1 with a single empty block with upper bound B */
-    block *b = block_create(M, 1);
-    b->upper = B;
-    b->min_val = __DBL_MIN__;
-    b->max_val = 100000000;
-    ds->D1_head = b;
+    int bidx = block_create(ds, M, 1);
+    ds->blocks[bidx].upper = B;
+    ds->blocks[bidx].min_val = DBL_MAX;
+    ds->blocks[bidx].max_val = -DBL_MAX;
+    ds->D1_head = bidx;
+    ds->tree_root = avl_insert_block(ds, ds->tree_root, ds->blocks[bidx].upper, bidx);
 
-    ds->tree_root = avl_insert_block(ds->tree_root, b->upper, b);
-    if (verb) printf("Creation complete\n");
     return ds;
 }
 
 void pivotds_destroy(pivot_ds *ds) {
     if (!ds) return;
 
-    /* Free D0 blocks */
-    block *b = ds->D1_head;
-    while (b) {
-        block *next = b->next;
-        block_free(b);
-        b = next;
+    avl_free_tree(ds, ds->tree_root);
+
+    for (int i = 0; i < ds->blocks_used; ++i) {
+        if (ds->blocks[i].alive && ds->blocks[i].items) free(ds->blocks[i].items);
     }
 
-    /* Free tree (without blocks) */
-    avl_free_tree(ds->tree_root);
-
+    free(ds->blocks);
+    free(ds->avl_nodes);
+    free(ds->bl_nodes);
     free(ds->key_block);
     free(ds->key_index);
     free(ds->key_dist);
     free(ds);
 }
 
+/* ---------- Forward decl ---------- */
+static void ds_remove_block(pivot_ds *ds, int bidx);
+
 /* ---------- Deletion of a single key ---------- */
 
 static void ds_delete_key(pivot_ds *ds, int key) {
     if (key < 0 || key >= ds->max_key) return;
-    block *b = ds->key_block[key];
-    if (!b) return;
 
+    int bidx = ds->key_block[key];
+    if (bidx == NIL) return;
+
+    block *b = &ds->blocks[bidx];
     int idx = ds->key_index[key];
     int last = b->size - 1;
 
-    /* Swap with last, update moved key's meta */
     if (idx != last) {
         b->items[idx] = b->items[last];
         int moved_key = b->items[idx].key;
         ds->key_index[moved_key] = idx;
-        ds->key_dist[moved_key]   = b->items[idx].val;
-        ds->key_block[moved_key] = b;
+        ds->key_dist[moved_key] = b->items[idx].val;
+        ds->key_block[moved_key] = bidx;
     }
     b->size--;
 
-    /* Clear metadata for removed key */
-    ds->key_block[key] = NULL;
+    ds->key_block[key] = NIL;
     ds->key_index[key] = -1;
-    ds->key_dist[key]   = 100000000;
+    ds->key_dist[key] = INF;
 
     if (b->size == 0) {
-        ds_remove_block(ds, b);
+        ds_remove_block(ds, bidx);
     } else {
-        /* Recompute min, max (size ≤ M) */
-        double mn = b->items[0].val;
-        double mx = b->items[0].val;
+        double mn = b->items[0].val, mx = b->items[0].val;
         for (int i = 1; i < b->size; ++i) {
             if (b->items[i].val < mn) mn = b->items[i].val;
             if (b->items[i].val > mx) mx = b->items[i].val;
         }
+
         double old_upper = b->upper;
         b->min_val = mn;
         b->max_val = mx;
-        b->upper   = mx;
+        b->upper = mx;
 
         if (b->in_D1 && old_upper != b->upper) {
-            ds->tree_root = avl_delete_block(ds->tree_root, old_upper, b);
-            ds->tree_root = avl_insert_block(ds->tree_root, b->upper, b);
+            ds->tree_root = avl_delete_block(ds, ds->tree_root, old_upper, bidx);
+            ds->tree_root = avl_insert_block(ds, ds->tree_root, b->upper, bidx);
         }
     }
 }
 
 /* ---------- Remove entire block from DS ---------- */
 
-static void ds_remove_block(pivot_ds *ds, block *b) {
-    if (!b) return;
+static void ds_remove_block(pivot_ds *ds, int bidx) {
+    if (bidx == NIL) return;
+    block *b = &ds->blocks[bidx];
 
-    /* Detach from linked list */
-    block **head_ptr = &ds->D1_head;
+    if (b->prev != NIL) ds->blocks[b->prev].next = b->next;
+    else ds->D1_head = b->next;
 
-    if (b->prev) {
-        b->prev->next = b->next;
-    } else {
-        *head_ptr = b->next;
-    }
-    if (b->next) {
-        b->next->prev = b->prev;
-    }
+    if (b->next != NIL) ds->blocks[b->next].prev = b->prev;
 
     if (b->in_D1) {
-        /* Remove from AVL */
-        ds->tree_root = avl_delete_block(ds->tree_root, b->upper, b);
+        ds->tree_root = avl_delete_block(ds, ds->tree_root, b->upper, bidx);
 
-        /* If D1 becomes empty, create a fresh empty block with upper B */
-        if (ds->D1_head == NULL) {
-            block *b = block_create(ds->M, 1);
-            b->upper = ds->bound;
-            b->min_val = __DBL_MIN__;
-            b->max_val = 100000000;
-            ds->D1_head = b;
-            ds->tree_root = avl_insert_block(ds->tree_root, b->upper, b);
+        if (ds->D1_head == NIL) {
+            int nb = block_create(ds, ds->M, 1);
+            ds->blocks[nb].upper = ds->bound;
+            ds->D1_head = nb;
+            ds->tree_root = avl_insert_block(ds, ds->tree_root, ds->blocks[nb].upper, nb);
         }
     }
 
-    block_free(b);
+    free_block_slot(ds, bidx);
 }
 
 static inline void dpair_swap(data_pair *a, data_pair *b) {
     data_pair t = *a; *a = *b; *b = t;
 }
 
-static void partition_by_val(data_pair *a, int lo, int hi, double pivot, int *out_lt, int *out_gt)
-{
+static void partition_by_val(data_pair *a, int lo, int hi, double pivot, int *out_lt, int *out_gt) {
     int lt = lo, i = lo, gt = hi;
     while (i <= gt) {
         double v = a[i].val;
@@ -426,6 +539,7 @@ static void insertion_sort_by_val(data_pair *a, int lo, int hi) {
     }
 }
 
+static void mom_select(data_pair *a, int lo, int hi, int nth);
 
 static double median_of_medians(data_pair *a, int lo, int hi) {
     int n = hi - lo + 1;
@@ -434,7 +548,6 @@ static double median_of_medians(data_pair *a, int lo, int hi) {
         return a[lo + n/2].val;
     }
 
-    // move medians of groups of 5 into front
     int m = 0;
     for (int g = lo; g <= hi; g += 5) {
         int g_hi = g + 4;
@@ -458,58 +571,51 @@ static void mom_select(data_pair *a, int lo, int hi, int nth) {
 
         if (nth < lt) hi = lt - 1;
         else if (nth > gt) lo = gt + 1;
-        else return; // nth in == pivot region
+        else return;
     }
 }
 
-
 /* ---------- Split a D1 block when size > M ---------- */
 
-static block* ds_split_block(pivot_ds *ds, block *b) {
-    if (!b || !b->in_D1) return NULL;
-    if (b->size < ds->M){
-        if (verb) printf("\n %d %d\n", b->size, ds->M);
-        return NULL;
-    }
-    if (verb) printf("\nSplitting block during insert\n");
+static int ds_split_block(pivot_ds *ds, int bidx) {
+    if (bidx == NIL) return NIL;
+    block *b = &ds->blocks[bidx];
+    if (!b->in_D1 || b->size < ds->M) return NIL;
+
     int n = b->size;
     double old_upper = b->upper;
 
     int n1 = n / 2;
     int n2 = n - n1;
-    
-    mom_select(b->items, 0, n - 1, n1);
-    
-    block *b2 = block_create(ds->M, 1);
 
-    //safe gaurd
+    mom_select(b->items, 0, n - 1, n1);
+
+    int b2idx = block_create(ds, ds->M, 1);
+    block *b2 = &ds->blocks[b2idx];
+
     if (b2->capacity < n2) {
         b2->capacity = n2;
         b2->items = (data_pair *)realloc(b2->items, sizeof(data_pair) * b2->capacity);
     }
 
-    /* Move upper half to new block */
     memcpy(b2->items, b->items + n1, sizeof(data_pair) * n2);
     b2->size = n2;
-
     b->size = n1;
 
-    /* Update per-key metadata */
     for (int i = 0; i < b->size; ++i) {
         int k = b->items[i].key;
-        ds->key_block[k] = b;
+        ds->key_block[k] = bidx;
         ds->key_index[k] = i;
-        ds->key_dist[k]   = b->items[i].val;
+        ds->key_dist[k] = b->items[i].val;
     }
     for (int i = 0; i < b2->size; ++i) {
         int k = b2->items[i].key;
-        ds->key_block[k] = b2;
+        ds->key_block[k] = b2idx;
         ds->key_index[k] = i;
-        ds->key_dist[k]   = b2->items[i].val;
+        ds->key_dist[k] = b2->items[i].val;
     }
 
-    /* Recompute block stats */
-    double bmin = 100000000, bmax = __DBL_MIN__;
+    double bmin = INF, bmax = -DBL_MAX;
     for (int i = 0; i < b->size; ++i) {
         double v = b->items[i].val;
         if (v < bmin) bmin = v;
@@ -517,7 +623,7 @@ static block* ds_split_block(pivot_ds *ds, block *b) {
     }
     b->min_val = bmin; b->max_val = bmax; b->upper = bmax;
 
-    double b2min = 100000000, b2max = __DBL_MIN__;
+    double b2min = INF, b2max = -DBL_MAX;
     for (int i = 0; i < b2->size; ++i) {
         double v = b2->items[i].val;
         if (v < b2min) b2min = v;
@@ -525,85 +631,64 @@ static block* ds_split_block(pivot_ds *ds, block *b) {
     }
     b2->min_val = b2min; b2->max_val = b2max; b2->upper = b2max;
 
-    /* Insert b2 after block in D1 list */
     b2->next = b->next;
-    b2->prev = b;
-    if (b->next) b->next->prev = b2;
-    b->next = b2;
+    b2->prev = bidx;
+    if (b->next != NIL) ds->blocks[b->next].prev = b2idx;
+    b->next = b2idx;
 
-    /* Update AVL: remove old mapping for block, insert new ones */
-    ds->tree_root = avl_delete_block(ds->tree_root, old_upper, b);
-    ds->tree_root = avl_insert_block(ds->tree_root, b->upper, b);
-    ds->tree_root = avl_insert_block(ds->tree_root, b2->upper, b2);
-    return b2;
+    ds->tree_root = avl_delete_block(ds, ds->tree_root, old_upper, bidx);
+    ds->tree_root = avl_insert_block(ds, ds->tree_root, b->upper, bidx);
+    ds->tree_root = avl_insert_block(ds, ds->tree_root, b2->upper, b2idx);
+
+    return b2idx;
 }
 
 /* ---------- Insert(a, b) ---------- */
 
-static avl_node* avl_max_node(avl_node *root) {
-    if (!root) return NULL;
-    while (root->right) root = root->right;
-    return root;
-}
-
 void pivotds_insert(pivot_ds *ds, int key, double val) {
-    // printf("Inserting\n");
     if (!ds) return;
     if (key < 0 || key >= ds->max_key) return;
 
-    /* Check existing key */
-    block *blk = ds->key_block[key];
-    if (blk) {
+    int blk = ds->key_block[key];
+    if (blk != NIL) {
         double old = ds->key_dist[key];
-        if (val >= old) {
-            /* Not better, ignore */
-            return;
-        }
-        /* Better value: delete old pair first */
+        if (val >= old) return;
         ds_delete_key(ds, key);
     }
 
-    /* Find appropriate D1 block via upper-bound tree */
-    block *target = NULL;
-    if (ds->tree_root) {
-        avl_node *node = avl_lower_bound(ds->tree_root, val);
-        if (!node) node = avl_max_node(ds->tree_root);
-        if (node && node->blocks) target = node->blocks->block_node;
+    int target_idx = NIL;
+    if (ds->tree_root != NIL) {
+        int node = avl_lower_bound(ds, ds->tree_root, val);
+        if (node == NIL) node = avl_max_node(ds, ds->tree_root);
+        if (node != NIL && ds->avl_nodes[node].blocks_head != NIL) {
+            target_idx = ds->bl_nodes[ds->avl_nodes[node].blocks_head].block_idx;
+        }
     }
-    if (!target) {
-        printf("Target not found\n");
-        /* Fallback: should not normally happen, but be safe */
-        target = ds->D1_head;
-    }
+    if (target_idx == NIL) target_idx = ds->D1_head;
 
-    /* Ensure capacity */
+    block *target = &ds->blocks[target_idx];
+
     if (ds->M == 1) {
-        block *nb = block_create(1, 1);
-        if (!nb) return;
-
+        int nbidx = block_create(ds, 1, 1);
+        block *nb = &ds->blocks[nbidx];
         nb->min_val = nb->max_val = nb->upper = val;
 
-        /* Insert nb BEFORE target to preserve upper-bound ordering */
-        nb->next = target;
+        nb->next = target_idx;
         nb->prev = target->prev;
-        if (target->prev) target->prev->next = nb;
-        else ds->D1_head = nb;
-        target->prev = nb;
+        if (target->prev != NIL) ds->blocks[target->prev].next = nbidx;
+        else ds->D1_head = nbidx;
+        target->prev = nbidx;
 
-        ds->tree_root = avl_insert_block(ds->tree_root, nb->upper, nb);
-        target = nb;
-    }else{
+        ds->tree_root = avl_insert_block(ds, ds->tree_root, nb->upper, nbidx);
+        target_idx = nbidx;
+        target = &ds->blocks[target_idx];
+    } else {
         if (target->size >= target->capacity) {
-            // split at median
-            if (verb) pivotds_print(ds,0);
-            block *b2 = ds_split_block(ds, target);
-            if (verb) pivotds_print(ds,0);
-            if (b2) {
-                // Decide which half should receive (key,val)
-                // After split: target is lower half, b2 is upper half.
-                if (val > target->upper){
-                    target = b2;
-                    if (verb) printf("target is block b2\n");
+            int b2idx = ds_split_block(ds, target_idx);
+            if (b2idx != NIL) {
+                if (val > target->upper) {
+                    target_idx = b2idx;
+                    target = &ds->blocks[target_idx];
                 }
             }
         }
@@ -614,38 +699,28 @@ void pivotds_insert(pivot_ds *ds, int key, double val) {
     target->items[idx].val = val;
     target->size++;
 
-    /* Update block stats */
     if (val < target->min_val) target->min_val = val;
     if (val > target->max_val) {
-        /* In principle val <= old upper from lower_bound, so this won't increase upper.
-           But we keep upper = max_val for robustness. */
         double old_upper = target->upper;
         target->max_val = val;
-        target->upper   = target->max_val;
+        target->upper = target->max_val;
         if (target->upper != old_upper) {
-            ds->tree_root = avl_delete_block(ds->tree_root, old_upper, target);
-            ds->tree_root = avl_insert_block(ds->tree_root, target->upper, target);
+            ds->tree_root = avl_delete_block(ds, ds->tree_root, old_upper, target_idx);
+            ds->tree_root = avl_insert_block(ds, ds->tree_root, target->upper, target_idx);
         }
     }
 
-    /* Update per-key metadata */
-    ds->key_block[key] = target;
+    ds->key_block[key] = target_idx;
     ds->key_index[key] = idx;
-    ds->key_dist[key]   = val;
-    
-    /* Split if necessary */
-    // if (target->size > ds->M) {
-    //     ds_split_block(ds, target);
-    // }
+    ds->key_dist[key] = val;
 }
 
 /* ---------- BatchPrepend(L) ---------- */
 
-/* Local hash map for dedup keys in L */
 typedef struct {
-    int    key;
+    int key;
     double val;
-    char   used;
+    char used;
 } LocalMapEntry;
 
 static int next_pow2(int n) {
@@ -657,7 +732,6 @@ static int next_pow2(int n) {
 void pivotds_batch_prepend(pivot_ds *ds, const data_pair *pairs, int L) {
     if (!ds || !pairs || L <= 0) return;
 
-    /* 1) Deduplicate keys within L using local hash map (key -> min value in L) */
     int table_size = next_pow2(L * 2);
     LocalMapEntry *table = (LocalMapEntry *)calloc(table_size, sizeof(LocalMapEntry));
     int mask = table_size - 1;
@@ -666,21 +740,16 @@ void pivotds_batch_prepend(pivot_ds *ds, const data_pair *pairs, int L) {
         int k = pairs[i].key;
         double v = pairs[i].val;
         int idx = (unsigned)k & (unsigned)mask;
-        while (table[idx].used && table[idx].key != k) {
-            idx = (idx + 1) & mask;
-        }
+        while (table[idx].used && table[idx].key != k) idx = (idx + 1) & mask;
         if (!table[idx].used) {
             table[idx].used = 1;
             table[idx].key = k;
             table[idx].val = v;
-        } else {
-            if (v < table[idx].val) {
-                table[idx].val = v;
-            }
+        } else if (v < table[idx].val) {
+            table[idx].val = v;
         }
     }
 
-    /* 2) Compare with existing DS, keep only strictly better values and delete old ones */
     data_pair *filtered = (data_pair *)malloc(sizeof(data_pair) * L);
     int fcount = 0;
 
@@ -689,16 +758,10 @@ void pivotds_batch_prepend(pivot_ds *ds, const data_pair *pairs, int L) {
         int k = table[i].key;
         if (k < 0 || k >= ds->max_key) continue;
         double newv = table[i].val;
-        block *blk = ds->key_block[k];
+        int blk = ds->key_block[k];
         double old = ds->key_dist[k];
-        if (blk && old <= newv) {
-            /* Existing value is smaller or equal -> ignore new one */
-            continue;
-        }
-        if (blk) {
-            /* Replace with strictly smaller */
-            ds_delete_key(ds, k);
-        }
+        if (blk != NIL && old <= newv) continue;
+        if (blk != NIL) ds_delete_key(ds, k);
         filtered[fcount].key = k;
         filtered[fcount].val = newv;
         fcount++;
@@ -711,11 +774,7 @@ void pivotds_batch_prepend(pivot_ds *ds, const data_pair *pairs, int L) {
         return;
     }
 
-    /* 3) Sort filtered ascending by value */
     qsort(filtered, fcount, sizeof(data_pair), compare_dpair_val);
-
-    /* 4) Build blocks in D0 from filtered, with correct block value ordering.
-       We process from the end backwards so that final D0 list is increasing by value. */
 
     int idx = fcount;
     while (idx > 0) {
@@ -723,39 +782,38 @@ void pivotds_batch_prepend(pivot_ds *ds, const data_pair *pairs, int L) {
         if (block_size > idx) block_size = idx;
         idx -= block_size;
 
-        block *b = block_create(ds->M, 1);  /* in_D1 = 1 */
-        if (!b) break;
+        int bidx = block_create(ds, ds->M, 1);
+        block *b = &ds->blocks[bidx];
+
         if (b->capacity < block_size) {
             data_pair *tmp = (data_pair *)realloc(b->items, sizeof(data_pair) * block_size);
             if (!tmp) {
-                block_free(b);
+                free_block_slot(ds, bidx);
                 break;
             }
             b->items = tmp;
             b->capacity = block_size;
         }
 
-        /* Copy chunk filtered[idx .. idx+block_size-1] */
         for (int j = 0; j < block_size; ++j) {
             data_pair p = filtered[idx + j];
             b->items[j] = p;
-            /* Update per-key metadata */
-            ds->key_block[p.key] = b;
+            ds->key_block[p.key] = bidx;
             ds->key_index[p.key] = j;
-            ds->key_dist[p.key]   = p.val;
-            // printf("added %d %f\t",p.val,ds->key_dist[k]);
+            ds->key_dist[p.key] = p.val;
         }
+
         b->size = block_size;
         b->min_val = filtered[idx].val;
         b->max_val = filtered[idx + block_size - 1].val;
-        b->upper   = b->max_val;  /* not used in D0, but keep consistent */
+        b->upper = b->max_val;
 
-        /* Prepend to D1 list */
-        b->prev = NULL;
+        b->prev = NIL;
         b->next = ds->D1_head;
-        if (ds->D1_head) ds->D1_head->prev = b;
-        ds->D1_head = b;
-        ds->tree_root = avl_insert_block(ds->tree_root, b->upper, b);
+        if (ds->D1_head != NIL) ds->blocks[ds->D1_head].prev = bidx;
+        ds->D1_head = bidx;
+
+        ds->tree_root = avl_insert_block(ds, ds->tree_root, b->upper, bidx);
     }
 
     free(filtered);
@@ -764,7 +822,7 @@ void pivotds_batch_prepend(pivot_ds *ds, const data_pair *pairs, int L) {
 /* ---------- Pull() ---------- */
 
 typedef struct {
-    int    key;
+    int key;
     double val;
 } Candidate;
 
@@ -776,220 +834,178 @@ static int compare_candidate_val(const void *a, const void *b) {
     return 0;
 }
 
-bool is_empty_pivotds(pivot_ds* ds){
-    if (verb) printf("Checking special ds is empty\n");
-    if (ds==NULL) return 1;
-    // printf("a\n");
-    if (ds->D1_head == NULL) return 1;
-    return 0;
+bool is_empty_pivotds(pivot_ds *ds) {
+    if (!ds) return 1;
+    return ds->D1_head == NIL;
 }
 
 bmssp_returns* pivotds_pull(pivot_ds *ds) {
-    if (verb) printf("Pulling elements from the special data structure, current bound is %.2f\n", ds->bound);
     if (!ds) return 0;
+
     bmssp_returns* pull_nodes = (bmssp_returns*)malloc(sizeof(bmssp_returns));
     pull_nodes->U = (node_set*)malloc(sizeof(node_set));
     init_node_set(pull_nodes->U, ds->max_key);
 
     int M = ds->M;
-
-    /* 1) Collect prefix blocks from D0 and D1, up to M elements each */
     Candidate *cand = (Candidate *)malloc(sizeof(Candidate) * (2 * M));
     int cand_count = 0;
 
-    block *b1 = ds->D1_head;
-    block *first_after_D1 = NULL;
+    int b1 = ds->D1_head;
+    int first_after_D1 = NIL;
     int count1 = 0;
 
-    while (b1 && count1 < M) {
-        for (int i = 0; i < b1->size && cand_count < 2 * M; ++i) {
-            cand[cand_count].key = b1->items[i].key;
-            cand[cand_count].val = b1->items[i].val;
+    while (b1 != NIL && count1 < M) {
+        block *blk = &ds->blocks[b1];
+        for (int i = 0; i < blk->size && cand_count < 2 * M; ++i) {
+            cand[cand_count].key = blk->items[i].key;
+            cand[cand_count].val = blk->items[i].val;
             cand_count++;
         }
-        count1 += b1->size;
+        count1 += blk->size;
         if (count1 >= M) {
-            first_after_D1 = b1->next;
+            first_after_D1 = blk->next;
             break;
         }
-        b1 = b1->next;
+        b1 = blk->next;
     }
-    // printf("count1: %d count0 %d\n", count0,count1);
-    if (!first_after_D1 && b1) {
-        // printf("first_after_D1: %d\n",first_after_D1);
-        first_after_D1 = b1->next;
-    }
+    if (first_after_D1 == NIL && b1 != NIL) first_after_D1 = ds->blocks[b1].next;
 
     if (cand_count == 0) {
-        /* No elements in DS */
-        // printf("/* No elements in DS */\n");
         pull_nodes->bound = ds->bound;
         free(cand);
         return pull_nodes;
     }
 
-    /* 2) Decide if we are returning all elements or only M smallest */
-    /* To know if we have all elements, we need to check whether any blocks remain
-       outside the prefixes. If not, S'_0 ∪ S'_1 is entire DS. */
     int all_D1_covered = 1;
-    block *b = ds->D1_head;
+    int b = ds->D1_head;
     int collected = 0;
-    while (b && collected < count1) {
-        collected += b->size;
-        b = b->next;
+    while (b != NIL && collected < count1) {
+        collected += ds->blocks[b].size;
+        b = ds->blocks[b].next;
     }
-    if (b != NULL) all_D1_covered = 0;
+    if (b != NIL) all_D1_covered = 0;
 
-    /* Case A: total elements ≤ M => return all, x = B */
     if (all_D1_covered && cand_count <= M) {
         for (int i = 0; i < cand_count; ++i) {
             node_set_add(pull_nodes->U, cand[i].key);
             ds_delete_key(ds, cand[i].key);
         }
-        
         pull_nodes->bound = ds->bound;
-        if (verb) printf("<=M elements in the block, so returning entire block, new bound = %.2f\n",pull_nodes->bound);
         free(cand);
         return pull_nodes;
     }
 
-    /* Case B: need to choose M smallest from cand[0 .. cand_count-1] */
     qsort(cand, cand_count, sizeof(Candidate), compare_candidate_val);
 
     int out_count = (cand_count < M) ? cand_count : M;
     if (out_count <= 0) {
-        pull_nodes->bound  = ds->bound; // needs change
+        pull_nodes->bound = ds->bound;
         free(cand);
         return pull_nodes;
     }
 
     double max_in_S = cand[out_count - 1].val;
-    if (verb) printf("Max in S: %.2f\n", max_in_S);
 
-    /* Remove those M keys from DS and output them */
     for (int i = 0; i < out_count; ++i) {
         node_set_add(pull_nodes->U, cand[i].key);
         ds_delete_key(ds, cand[i].key);
     }
 
-    /* Compute x: smallest remaining value in DS.
-       It must satisfy max(S') < x ≤ min(D_remaining).
-       Remaining candidates are cand[out_count .. cand_count-1], all from prefixes.
-       Plus blocks after the prefixes: first_after_D0 and first_after_D1. */
-
-    double x = 100000000;
-    if (verb) printf("Getting the bound in DS %d %d\n",out_count,cand_count);
+    double x = INF;
     for (int i = out_count; i < cand_count; ++i) {
-        // printf("%d", cand[i].val >= max_in_S && cand[i].val < x);
-        if (cand[i].val >= max_in_S && cand[i].val < x) {
-            x = cand[i].val;
-        }
+        if (cand[i].val >= max_in_S && cand[i].val < x) x = cand[i].val;
     }
-    if (verb) printf("Max in S: %.2f\n", x);
 
-    while(first_after_D1){
-        // if (verb) printf("|%.2f|", first_after_D1->min_val);
-        if (first_after_D1 && first_after_D1->size > 0 && first_after_D1->min_val >= max_in_S && first_after_D1->min_val < x) x = first_after_D1->min_val;
-        first_after_D1 = first_after_D1->next;
+    while (first_after_D1 != NIL) {
+        block *blk = &ds->blocks[first_after_D1];
+        if (blk->size > 0 && blk->min_val >= max_in_S && blk->min_val < x) x = blk->min_val;
+        first_after_D1 = blk->next;
     }
-    if (verb) printf("Updated x: %.2f", x);
 
-    /* If nothing remains, x = B */
-    pull_nodes->bound = (x == 100000000) ? ds->bound : x;
-
+    pull_nodes->bound = (x == INF) ? ds->bound : x;
     free(cand);
     return pull_nodes;
 }
 
-static void print_block(block *b, const char *label) {
-    printf("%s (size=%d, min=%.2f, max=%.2f, upper=%.2f, in_D1=%d)\n",
-        label, b->size,
-        b->min_val,
-        b->max_val,
-        b->upper,
-        b->in_D1);
+/* ---------- Debug ---------- */
+
+static void print_block(pivot_ds *ds, int bidx, const char *label) {
+    block *b = &ds->blocks[bidx];
+    printf("%s [idx=%d] (size=%d, min=%.2f, max=%.2f, upper=%.2f, in_D1=%d, prev=%d, next=%d)\n",
+        label, bidx, b->size, b->min_val, b->max_val, b->upper, b->in_D1, b->prev, b->next);
 
     printf("   items: ");
     for (int i = 0; i < b->size; ++i) {
-        printf("(%d,%.2f) ",
-               b->items[i].key,
-               b->items[i].val);
+        printf("(%d,%.2f) ", b->items[i].key, b->items[i].val);
     }
     printf("\n");
 }
 
-static void print_block_list(block *head, const char *name) {
+static void print_block_list(pivot_ds *ds, int head, const char *name) {
     printf("\n===== %s BLOCK LIST =====\n", name);
     int idx = 0;
-    block *b = head;
-    while (b) {
+    int b = head;
+    while (b != NIL) {
         char label[64];
         snprintf(label, sizeof(label), "%s[%d]", name, idx);
-        print_block(b, label);
-        b = b->next;
+        print_block(ds, b, label);
+        b = ds->blocks[b].next;
         idx++;
     }
     if (idx == 0) printf("(empty)\n");
 }
 
-/* Recursive AVL printer */
-static void print_avl(avl_node *root, int depth) {
-    if (!root) return;
+static void print_avl(pivot_ds *ds, int root, int depth) {
+    if (root == NIL) return;
 
-    print_avl(root->right, depth + 1);
+    print_avl(ds, ds->avl_nodes[root].right, depth + 1);
 
     for (int i = 0; i < depth; ++i) printf("        ");
-    printf("-> [upper=%.2f]  blocks: ",
-           root->key);
+    printf("-> [node=%d upper=%.2f] blocks: ", root, ds->avl_nodes[root].key);
 
-    block_list_node *bl = root->blocks;
-    while (bl) {
-        printf("%p ", (void*)bl->block_node);
-        bl = bl->next;
+    int bl = ds->avl_nodes[root].blocks_head;
+    while (bl != NIL) {
+        printf("%d ", ds->bl_nodes[bl].block_idx);
+        bl = ds->bl_nodes[bl].next;
     }
     printf("\n");
 
-    print_avl(root->left, depth + 1);
+    print_avl(ds, ds->avl_nodes[root].left, depth + 1);
 }
 
 static void print_tree(pivot_ds *ds) {
     printf("\n===== AVL TREE (D1 upper bounds) =====\n");
-    if (!ds->tree_root) {
+    if (ds->tree_root == NIL) {
         printf("(empty)\n");
         return;
     }
-    print_avl(ds->tree_root, 0);
+    print_avl(ds, ds->tree_root, 0);
 }
 
-/* Optional: key metadata printer */
 static void print_key_metadata(pivot_ds *ds) {
     printf("\n===== PER-KEY METADATA =====\n");
     for (int k = 0; k < ds->max_key; ++k) {
-        if (ds->key_block[k]) {
-            printf("key=%d → val=%.2f  block=%p  idx=%d\n",
-                   k,
-                   ds->key_dist[k],
-                   (void*)ds->key_block[k],
-                   ds->key_index[k]);
+        if (ds->key_block[k] != NIL) {
+            printf("key=%d -> val=%.2f block=%d idx=%d\n",
+                   k, ds->key_dist[k], ds->key_block[k], ds->key_index[k]);
         }
     }
 }
 
-/* PUBLIC DEBUG FUNCTION */
 void pivotds_print(pivot_ds *ds, int show_keys) {
     if (!ds) return;
 
     printf("\n=====================================================\n");
     printf("               SNAPSHOT OF Pivot_ds (D)\n");
     printf("=====================================================\n");
-    printf("M=%d   B=%.2f   max_key=%d\n",
-           ds->M, ds->bound, ds->max_key);
+    printf("M=%d   B=%.2f   max_key=%d   D1_head=%d   tree_root=%d\n",
+           ds->M, ds->bound, ds->max_key, ds->D1_head, ds->tree_root);
 
-    print_block_list(ds->D1_head, "D1");
+    print_block_list(ds, ds->D1_head, "D1");
     print_tree(ds);
 
-    if (show_keys)
-        print_key_metadata(ds);
+    if (show_keys) print_key_metadata(ds);
 
     printf("=====================================================\n\n");
 }
+
