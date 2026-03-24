@@ -37,9 +37,7 @@ typedef struct pivot_ds{
     int      M;
     double   bound;
     int      max_key;
-
-    /* Two sequences of blocks */
-    block   *D0_head;  /* batch-prepend blocks */
+    
     block   *D1_head;  /* insert blocks */
 
     /* Balanced tree over D1 block uppers */

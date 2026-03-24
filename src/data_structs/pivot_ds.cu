@@ -270,7 +270,6 @@ pivot_ds *pivotds_create(int M, double B, int max_key) {
     ds->bound = B;
     ds->max_key = max_key;
 
-    ds->D0_head = NULL;
     ds->D1_head = NULL;
     ds->tree_root = NULL;
 
@@ -300,15 +299,7 @@ void pivotds_destroy(pivot_ds *ds) {
     if (!ds) return;
 
     /* Free D0 blocks */
-    block *b = ds->D0_head;
-    while (b) {
-        block *next = b->next;
-        block_free(b);
-        b = next;
-    }
-
-    /* Free D1 blocks */
-    b = ds->D1_head;
+    block *b = ds->D1_head;
     while (b) {
         block *next = b->next;
         block_free(b);
@@ -377,7 +368,7 @@ static void ds_remove_block(pivot_ds *ds, block *b) {
     if (!b) return;
 
     /* Detach from linked list */
-    block **head_ptr = b->in_D1 ? &ds->D1_head : &ds->D0_head;
+    block **head_ptr = &ds->D1_head;
 
     if (b->prev) {
         b->prev->next = b->next;
@@ -573,7 +564,7 @@ void pivotds_insert(pivot_ds *ds, int key, double val) {
     }
 
     /* Find appropriate D1 block via upper-bound tree */
-    block *target;
+    block *target = NULL;
     if (ds->tree_root) {
         avl_node *node = avl_lower_bound(ds->tree_root, val);
         if (!node) node = avl_max_node(ds->tree_root);
@@ -732,10 +723,16 @@ void pivotds_batch_prepend(pivot_ds *ds, const data_pair *pairs, int L) {
         if (block_size > idx) block_size = idx;
         idx -= block_size;
 
-        block *b = block_create(ds->M, 0);  /* in_D1 = 0 */
+        block *b = block_create(ds->M, 1);  /* in_D1 = 1 */
+        if (!b) break;
         if (b->capacity < block_size) {
+            data_pair *tmp = (data_pair *)realloc(b->items, sizeof(data_pair) * block_size);
+            if (!tmp) {
+                block_free(b);
+                break;
+            }
+            b->items = tmp;
             b->capacity = block_size;
-            b->items = (data_pair *)realloc(b->items, sizeof(data_pair) * b->capacity);
         }
 
         /* Copy chunk filtered[idx .. idx+block_size-1] */
@@ -743,10 +740,9 @@ void pivotds_batch_prepend(pivot_ds *ds, const data_pair *pairs, int L) {
             data_pair p = filtered[idx + j];
             b->items[j] = p;
             /* Update per-key metadata */
-            int k = p.key;
-            ds->key_block[k] = b;
-            ds->key_index[k] = j;
-            ds->key_dist[k]   = p.val;
+            ds->key_block[p.key] = b;
+            ds->key_index[p.key] = j;
+            ds->key_dist[p.key]   = p.val;
             // printf("added %d %f\t",p.val,ds->key_dist[k]);
         }
         b->size = block_size;
@@ -754,11 +750,12 @@ void pivotds_batch_prepend(pivot_ds *ds, const data_pair *pairs, int L) {
         b->max_val = filtered[idx + block_size - 1].val;
         b->upper   = b->max_val;  /* not used in D0, but keep consistent */
 
-        /* Prepend to D0 list */
+        /* Prepend to D1 list */
         b->prev = NULL;
-        b->next = ds->D0_head;
-        if (ds->D0_head) ds->D0_head->prev = b;
-        ds->D0_head = b;
+        b->next = ds->D1_head;
+        if (ds->D1_head) ds->D1_head->prev = b;
+        ds->D1_head = b;
+        ds->tree_root = avl_insert_block(ds->tree_root, b->upper, b);
     }
 
     free(filtered);
@@ -783,15 +780,7 @@ bool is_empty_pivotds(pivot_ds* ds){
     if (verb) printf("Checking special ds is empty\n");
     if (ds==NULL) return 1;
     // printf("a\n");
-    if (ds->D0_head==NULL && ds->D1_head == NULL) return 1;
-    // printf("b\n");
-    if (ds->D0_head==NULL){
-        return (ds->D1_head->size == 0);
-    }
-    // printf("c\n");
-    if (ds->D1_head==NULL){
-        return (ds->D0_head->size == 0);
-    }
+    if (ds->D1_head == NULL) return 1;
     return 0;
 }
 
@@ -807,30 +796,6 @@ bmssp_returns* pivotds_pull(pivot_ds *ds) {
     /* 1) Collect prefix blocks from D0 and D1, up to M elements each */
     Candidate *cand = (Candidate *)malloc(sizeof(Candidate) * (2 * M));
     int cand_count = 0;
-
-    block *b0 = ds->D0_head;
-    block *first_after_D0 = NULL;
-    int count0 = 0;
-
-    while (b0 && count0 < M) {
-        /* All elements in b0 are part of S'_0 */
-        // printf("/* All elements in b0 are part of S'_0 */\n");
-        for (int i = 0; i < b0->size && cand_count < 2 * M; ++i) {
-            cand[cand_count].key = b0->items[i].key;
-            cand[cand_count].val = b0->items[i].val;
-            // printf("k: %d v: %.2f\n",cand[cand_count].key, cand[cand_count].val);
-            cand_count++;
-        }
-        count0 += b0->size;
-        if (count0 >= M) {
-            first_after_D0 = b0->next;
-            break;
-        }
-        b0 = b0->next;
-    }
-    if (!first_after_D0 && b0) {
-        first_after_D0 = b0->next;
-    }
 
     block *b1 = ds->D1_head;
     block *first_after_D1 = NULL;
@@ -866,35 +831,19 @@ bmssp_returns* pivotds_pull(pivot_ds *ds) {
     /* 2) Decide if we are returning all elements or only M smallest */
     /* To know if we have all elements, we need to check whether any blocks remain
        outside the prefixes. If not, S'_0 ∪ S'_1 is entire DS. */
-
-    int all_D0_covered = 1;
-    block *b = ds->D0_head;
-    int collected = 0;
-    while (b && collected < count0) {
-        collected += b->size;
-        b = b->next;
-    }
-    if (b != NULL) all_D0_covered = 0;
-    // printf("all_D0_covered %d\n",all_D0_covered);
     int all_D1_covered = 1;
-    b = ds->D1_head;
-    collected = 0;
+    block *b = ds->D1_head;
+    int collected = 0;
     while (b && collected < count1) {
         collected += b->size;
         b = b->next;
     }
     if (b != NULL) all_D1_covered = 0;
-    // printf("all_D1_covered %d\n",all_D1_covered);
-
-    int total_is_all = all_D0_covered && all_D1_covered;
 
     /* Case A: total elements ≤ M => return all, x = B */
-    if (total_is_all && cand_count <= M) {
-        int k = cand_count;
-        for (int i = 0; i < k; ++i) {
+    if (all_D1_covered && cand_count <= M) {
+        for (int i = 0; i < cand_count; ++i) {
             node_set_add(pull_nodes->U, cand[i].key);
-            // out_pairs[i].key = cand[i].key;
-            // out_pairs[i].val = cand[i].val;
             ds_delete_key(ds, cand[i].key);
         }
         
@@ -920,8 +869,6 @@ bmssp_returns* pivotds_pull(pivot_ds *ds) {
     /* Remove those M keys from DS and output them */
     for (int i = 0; i < out_count; ++i) {
         node_set_add(pull_nodes->U, cand[i].key);
-        // out_pairs[i].key = cand[i].key;
-        // out_pairs[i].val = cand[i].val;
         ds_delete_key(ds, cand[i].key);
     }
 
@@ -930,7 +877,7 @@ bmssp_returns* pivotds_pull(pivot_ds *ds) {
        Remaining candidates are cand[out_count .. cand_count-1], all from prefixes.
        Plus blocks after the prefixes: first_after_D0 and first_after_D1. */
 
-    double x = ds->bound;
+    double x = 100000000;
     if (verb) printf("Getting the bound in DS %d %d\n",out_count,cand_count);
     for (int i = out_count; i < cand_count; ++i) {
         // printf("%d", cand[i].val >= max_in_S && cand[i].val < x);
@@ -940,26 +887,15 @@ bmssp_returns* pivotds_pull(pivot_ds *ds) {
     }
     if (verb) printf("Max in S: %.2f\n", x);
 
-    if (first_after_D0 && first_after_D0->size > 0 && first_after_D0->min_val >= max_in_S) {
-        if (first_after_D0->min_val < x) x = first_after_D0->min_val;
-    }
     while(first_after_D1){
         // if (verb) printf("|%.2f|", first_after_D1->min_val);
-        if (first_after_D1 && first_after_D1->size > 0 && first_after_D1->min_val >= max_in_S) {
-            // printf("%d|",first_after_D1->min_val);
-            if (first_after_D1->min_val < x) x = first_after_D1->min_val;
-            // if (verb) printf("x: %.2f", x);
-        }
+        if (first_after_D1 && first_after_D1->size > 0 && first_after_D1->min_val >= max_in_S && first_after_D1->min_val < x) x = first_after_D1->min_val;
         first_after_D1 = first_after_D1->next;
     }
     if (verb) printf("Updated x: %.2f", x);
 
     /* If nothing remains, x = B */
-    if (x == ds->bound) {
-        pull_nodes->bound = ds->bound;
-    } else {
-        pull_nodes->bound = x;
-    }
+    pull_nodes->bound = (x == 100000000) ? ds->bound : x;
 
     free(cand);
     return pull_nodes;
@@ -1049,7 +985,6 @@ void pivotds_print(pivot_ds *ds, int show_keys) {
     printf("M=%d   B=%.2f   max_key=%d\n",
            ds->M, ds->bound, ds->max_key);
 
-    print_block_list(ds->D0_head, "D0");
     print_block_list(ds->D1_head, "D1");
     print_tree(ds);
 
