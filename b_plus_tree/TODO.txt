@@ -1,0 +1,5 @@
+GOAL: Pass tests 1-4.
+
+1.
+* Fix insertion logic
+* Reinstate splitting pass
